@@ -444,6 +444,12 @@ def _pretty_attr_value(obj, attr_name, stringify_fn=None):
 pretty_print_modules = 'btrfs.ctree', 'btrfs.ioctl', 'btrfs.fs_usage'
 
 
+def list_like_object(obj):
+    return isinstance(obj, (list, types.GeneratorType)) or \
+            (isinstance(obj, btrfs.ctree.ItemData) and
+             isinstance(obj, collections.abc.MutableSequence))
+
+
 def _pretty_obj_tuples(obj, level=0, seen=None):
     if seen is None:
         seen = []
@@ -557,3 +563,45 @@ def pretty_print(obj):
         used: 960.50MiB
     """
     _pretty_print(obj)
+
+
+def _str_obj_tuples(obj, level=0, seen=None):
+    if seen is None:
+        seen = []
+    if isinstance(obj, (btrfs.ctree.ItemData, btrfs.ctree.SubItem)):
+        yield level, str(obj)
+    if obj in seen:
+        yield level, "[... object already seen, aborting recursion]"
+        return
+    seen.append(obj)
+    if isinstance(obj, btrfs.ctree.ItemData):
+        for attr_name, attr_value in obj.__dict__.items():
+            if attr_name.startswith('_'):
+                continue
+            if isinstance(obj, (btrfs.ctree.ItemData, btrfs.ctree.SubItem)):
+                yield from _str_obj_tuples(attr_value, level+1, seen)
+            elif isinstance(attr_value, list):
+                for item in attr_value:
+                    yield from _str_obj_tuples(item, level+1, seen)
+    if isinstance(obj, (list, types.GeneratorType)):
+        for item in obj:
+            yield from _str_obj_tuples(item, level, seen)
+    elif isinstance(obj, btrfs.ctree.ItemData) and \
+            isinstance(obj, collections.abc.MutableSequence):
+        for item in obj:
+            yield from _str_obj_tuples(item, level+1, seen)
+    seen.pop()
+
+
+def _str_print_lines(obj, level=0):
+    for level, line in _str_obj_tuples(obj, level):
+        yield "{}{}".format('  ' * level, line)
+
+
+def str_print(obj):
+    """
+    Print the usual str() of an object, but look inside to see if more ItemData
+    objects are hidden inside. Also print their str(),
+    """
+    for line in _str_print_lines(obj):
+        print(line)
