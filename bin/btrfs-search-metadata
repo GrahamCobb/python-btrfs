@@ -1,0 +1,188 @@
+#!/usr/bin/python3
+#
+# Copyright (C) 2019 Hans van Kranenburg <hans@knorrie.org>
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+import argparse
+import btrfs
+import errno
+import os
+import sys
+
+
+class Bork(Exception):
+    pass
+
+
+def get_chunks(fs, **kwargs):
+    return fs.chunks()
+
+
+def get_block_groups(fs, **kwargs):
+    for chunk in fs.chunks():
+        try:
+            yield fs.block_group(chunk.vaddr, chunk.length)
+        except btrfs.ctree.ItemNotFoundError:
+            # This is simply to prevent the program from aborting when a block
+            # group is removed in between doing the chunks lookup and the block
+            # group item lookup.
+            pass
+
+
+def get_dev_extents(fs, **kwargs):
+    return fs.dev_extents()
+
+
+def get_inode_info(fs, **kwargs):
+    inum = os.fstat(fs.fd).st_ino
+    min_key = btrfs.ctree.Key(inum, 0, 0)
+    max_key = btrfs.ctree.Key(inum, -1, -1)
+    # The special tree value of 0 will cause a search in the subvolume tree
+    # that the inode which was used to open the file system object is part of.
+    for header, data in btrfs.ioctl.search_v2(fs.fd, 0, min_key, max_key):
+        yield btrfs.ctree.classify(header, data)
+
+
+def get_devices(fs, **kwargs):
+    return fs.devices()
+
+
+def get_dev_info(fs, **kwargs):
+    for dev_item in fs.devices():
+        yield fs.dev_info(dev_item.devid)
+
+
+def get_dev_stats(fs, **kwargs):
+    for dev_item in fs.devices():
+        yield fs.dev_stats(dev_item.devid)
+
+
+def dump(fs, tree, **kwargs):
+    try:
+        tree_id = btrfs.utils.parse_tree_name(tree)
+    except ValueError as ve:
+        raise Bork(str(ve))
+    try:
+        for header, data in btrfs.ioctl.search_v2(fs.fd, tree_id):
+            yield btrfs.ctree.classify(header, data)
+    except FileNotFoundError:
+        raise Bork("tree {} does not exist".format(tree))
+
+
+def args_dump(subparsers, command):
+    parser = subparsers.add_parser(
+        command,
+    )
+    parser.add_argument(
+        '-t',
+        '--tree',
+        help="ID or name of the metadata tree to use for the search",
+    )
+    parser.add_argument(
+        'path',
+        help="Filesystem path pointing inside a mounted Btrfs filesystem",
+    )
+
+
+def args_default(subparsers, command):
+    parser = subparsers.add_parser(
+        command,
+    )
+    parser.add_argument(
+        'path',
+        help="Filesystem path pointing inside a mounted Btrfs filesystem",
+    )
+
+
+presets = {
+    'chunks': (get_chunks, args_default),
+    'block_groups': (get_block_groups, args_default),
+    'dev_extents': (get_dev_extents, args_default),
+    'inode': (get_inode_info, args_default),
+    'devices': (get_devices, args_default),
+    'dev_info': (get_dev_info, args_default),
+    'dev_stats': (get_dev_stats, args_default),
+    'dump': (dump, args_dump),
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-l',
+        '--long',
+        action="store_true",
+        default=False,
+        help="Write full contents of metadata items, instead of a single line per item."
+    )
+    subparsers = parser.add_subparsers(
+        dest='preset',
+        help='sub-command help'
+    )
+    for preset in presets.keys():
+        _, args_fn = presets[preset]
+        args_fn(subparsers, preset)
+    return parser.parse_args()
+
+
+def permission_check(fs):
+    """This is a simple canary function that explodes if the user does not have
+    enough permissions to use the search ioctl.
+    """
+    fs.top_level()
+
+
+def main():
+    args = parse_args()
+    if args.long:
+        output_fn = btrfs.utils.pretty_print
+    else:
+        output_fn = btrfs.utils.str_print
+    preset = args.preset
+    path = args.path
+    try:
+        with btrfs.FileSystem(path) as fs:
+            permission_check(fs)
+            if preset in presets:
+                output_fn(presets[preset][0](fs, **vars(args)))
+            else:
+                raise Bork("Unknown preset search type.")
+    except OSError as e:
+        if e.errno == errno.EPERM:
+            raise Bork("Insufficient permissions to use the btrfs kernel API.\n"
+                       "Hint: Try running the script as root user.".format(e))
+        elif e.errno == errno.ENOTTY:
+            raise Bork("Unable to retrieve data. Hint: Not a mounted btrfs file system?")
+        raise
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Exiting...")
+        sys.exit(130)  # 128 + SIGINT
+    except Bork as e:
+        print("Error: {0}".format(e), file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(e)
+        sys.exit(1)
